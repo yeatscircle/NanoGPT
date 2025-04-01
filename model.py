@@ -246,4 +246,45 @@ class GPT(nn.Module):
                 # 见上述：self.register_buffer    ？这个作用
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    def
+
+    # 这个表示这个方法是和类绑定的而不是和实体类绑定的--可以通过这个方法直接修改到class的内部属性
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert  model_type in {'gpt', 'gpt2-medium', 'gpt2-large', 'gpt-xl'}
+        override_args = override_args or {} # default to empty dict
+        # only dropout can be overridden see more notes below
+        assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" %model_type)
+
+
+        # n_layer, n_head and n_embed are determined from model_type
+        config_args = {
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
+        }[model_type]
+
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config_args['bias'] = True
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f'overriding dropout rate to {override_args['dropout']}')
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized miniGpt model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+
+        # copy white ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
