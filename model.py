@@ -1,6 +1,7 @@
 """
 Full definition of a GPT language model
 """
+import inspect
 import math
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ class GPTConfig:
     vocab_size: int = 50304 # GPT的vocab_size 为50257， padding到一个64的倍数
     n_layer: int = 12
     n_head: int = 12
-    n_embed: int = 768
+    n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True
 
@@ -44,20 +45,20 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
 
         # 这里是因为后续会做多头处理
-        assert config.n_embed % config.n_head == 0
+        assert config.n_embd % config.n_head == 0
 
         # key, query, value projection for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3, bias=config.bias)
 
         # output projection
-        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
         self.n_head = config.n_head
-        self.n_embed = config.n_embed
+        self.n_embd = config.n_embd
         self.dropout = config.dropout
 
         # flash attention make GPU go brrrr
@@ -74,8 +75,8 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # Calculate query , key, values for all heads in batch and move head forward to the batch dim
-        # 注意这里是输入了X了, 所以第一次相乘后的维度为（B, T, embed * 3）
-        q, k, v = self.c_attn.split(self.n_embed, dim=2)
+        # 注意这里是输入了X了, 所以第一次相乘后的维度为（B, T, embd * 3）
+        q, k, v = self.c_attn.split(self.n_embd, dim=2)
 
         # 分为多个头最终产生最后的效果，多头的使用不是每个K，V，Q负责所有模块而是负责一部分
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -103,13 +104,13 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         """
         def gelu(x):
             return 0.5 * x * (1 + nn.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)
         """
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embed, config. n_embed, bias=config.bias)
+        self.c_proj = nn.Linear(4 * config.n_embd, config. n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
 
@@ -124,9 +125,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embed, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embed, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
 
@@ -146,16 +147,16 @@ class GPT(nn.Module):
 
         #
         self.transformers = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embed),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
             # 正好和之前的max_block_embedding对应
-            wpe = nn.Embedding(config.block_size, config.n_embed),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embed, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         # 这个lm_head可以理解为选择的自回归为下流任务
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight trying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in the future version."
@@ -211,10 +212,10 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        token_embed = self.transformers.wte(idx)
-        pos_embed = self.transformers.wpe(pos)
+        token_embd = self.transformers.wte(idx)
+        pos_embd = self.transformers.wpe(pos)
 
-        x = self.transformers.drop(token_embed+pos_embed)
+        x = self.transformers.drop(token_embd+pos_embd)
         for block in self.transformers.h:
             x = block(x)
         x = self.transformers.ln_f(x)
@@ -250,7 +251,9 @@ class GPT(nn.Module):
     # 这个表示这个方法是和类绑定的而不是和实体类绑定的--可以通过这个方法直接修改到class的内部属性
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
+        # 选择模型加载的型号
         assert  model_type in {'gpt', 'gpt2-medium', 'gpt2-large', 'gpt-xl'}
+        # 这里是可以选择覆盖的参数-但是这个本质上是加载预训练数据, 所以这里只能够覆盖dropout
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
@@ -258,7 +261,7 @@ class GPT(nn.Module):
         print("loading weights from pretrained gpt: %s" %model_type)
 
 
-        # n_layer, n_head and n_embed are determined from model_type
+        # n_layer, n_head and n_embd are determined from model_type
         config_args = {
             'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
             'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
@@ -266,25 +269,89 @@ class GPT(nn.Module):
             'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
 
+        # 这里是补充关于gpt的剩余部分的数据
         config_args['vocab_size'] = 50257
         config_args['block_size'] = 1024
         config_args['bias'] = True
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
-            print(f'overriding dropout rate to {override_args['dropout']}')
-            config_args['dropout'] = override_args['dropout']
+            print(f'overriding dropout rate to {override_args["dropout"]}')
+            config_args['dropout'] = override_args["dropout"]
         # create a from-scratch initialized miniGpt model
         config = GPTConfig(**config_args)
+        # 这里得到一个初始化的模型参数
         model = GPT(config)
+        # 这里能够载入模型的参数
         sd = model.state_dict()
+        # 拿到所有参数的名字
         sd_keys = sd.keys()
+        # 过滤到这个attn.bias的数据, 上文有提及,该部分注册于buffer里面不需要训练
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
+        # init a huggingface/transformers model--这里是下载官方的权重.这个HeadModel不是指的lm_head
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-
         # copy white ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
+        # 去除掉官方权重的masked_bias和bias部分, 因为这是预先设置的而不是可学习的部分
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear--https://blog.csdn.net/sunny_xsc1994/article/details/82969867
+        # this means that we have to transpose these weights when we import them
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'attn.c_fc.weight', 'mlp.c_proj.weight']
+
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # 特殊处理关于Conv1d权重向linear转换的过程
+                # 这个是检验转置后的参数应该一致
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidata parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require gard
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >=2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_group = [
+            {'params':decay_params, 'weight_decay':weight_decay},
+            {'params':nodecay_params, 'weight_decay':0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f'num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters')
+        print(f'num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters')
+
+        # create AdamW optimizer and use the fused version if it is available
+        # inspect.signature(torch.optim.AdamW)--拿到这个AdamW的方法前面,查看是否存在parameters参数
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        used_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if used_fused else dict()
+        optimizer = torch.optim.AdamW(optim_group, lr=learning_rate, betas=betas, **extra_args)
+        print(f'using fused AdamW:{used_fused}')
+
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per, dt):
+
+
+
+
+
+
+
