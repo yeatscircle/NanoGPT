@@ -11,7 +11,7 @@ from dataclasses import dataclass
 # @dataclass自动生成常见的特殊方法
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 1024 # 模型能够处理的最长序列
     vocab_size: int = 50304 # GPT的vocab_size 为50257， padding到一个64的倍数
     n_layer: int = 12
     n_head: int = 12
@@ -37,6 +37,8 @@ class LayerNorm(nn.Module):
                             , self.bias, self.eps)
 
 
+
+# 这里是把所有的attention的部分合并，最后显示出一个因果自注意机制
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -145,30 +147,103 @@ class GPT(nn.Module):
         #
         self.transformers = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embed),
+            # 正好和之前的max_block_embedding对应
             wpe = nn.Embedding(config.block_size, config.n_embed),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embed, bias=config.bias),
         ))
 
+        # 这个lm_head可以理解为选择的自回归为下流任务
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         # with weight trying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in the future version."
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        # 自回归属于单独的一个模块
+
         self.transformers.wte.weight = self.lm_head.weight
 
-        # init all weights
-        self.apply(self._in)
+        # init all weights--在huggingface的库里面也会产生这种问题，也就是扩大在fine-tuning的时候需要初始化，原因是他的过程是先
+        # 初始化再选择pretrain的覆盖，这样可以避免部分参数没有成功初始化
+        # apply是遍历模型的所有权重
+        self.apply(self._init_weights)
+
+        # apply special scaled init to the residual projection, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
 
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
 
-    #
-    # def get_num_params(self, non_embedding=True):
-    #     """
-    #
-    #     :param non_embedding:
-    #     :return:
-    #     """
-    #     n_params = sum(p)
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of the parameters in the model.
+        Fro non-embedding count(default), the position embedddings get substracted.
+        The token embeddings would too, except due to the parameter sharing these params
+        are actually used as weights in the final layer, so we include them.
+        """
+        # numel返回张量的总数
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformers.wpe.weight.numel()
+        return n_params
+
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # 这个可以尝试xavier  https://zhuanlan.zhihu.com/p/648576849
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding)        :
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+    def forward(self, idx, target=None):
+        device = idx.device
+        # 这里传入的是tokenizer后的序列
+        b, t = idx.shape
+        assert t<= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
+        # forward the GPT model itself
+        token_embed = self.transformers.wte(idx)
+        pos_embed = self.transformers.wpe(pos)
+
+        x = self.transformers.drop(token_embed+pos_embed)
+        for block in self.transformers.h:
+            x = block(x)
+        x = self.transformers.ln_f(x)
+
+        if target is None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            # 这个ignore index处理的是类似于padding之类的，这里是padding为-1
+            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), target.view(-1),ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last postion
+            # 这里只是用最后一个token进行预测，上一个token已经通过MLA获取到了前面所有token的信息，是一个具像化的表现
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g.we may load the GPT2 pretrained model checkpoint (block_size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.block_size
+        self.config.block_size = block_size
+        self.transformers.wpe.weight = self.transformers.wpe.weight[:block_size]
+
+        for block in self.transformers.h:
+            if hasattr(block.attn, 'bias'):
+                # 见上述：self.register_buffer    ？这个作用
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+    def
