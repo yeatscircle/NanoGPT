@@ -380,10 +380,12 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context if growing too long we mush crop it at block_size
-            idx_cond = id if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
+            # temperature是用与创造多样性的，temperature如果小于1则全部按比例放大，但是拉大了差值是的最终结果更加保守
+            # 反之多样性增加
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -392,6 +394,8 @@ class GPT(nn.Module):
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
+
+            # 这里并没有选择是用greedy decoding而是创造多样性
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
